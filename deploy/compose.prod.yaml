@@ -1,0 +1,65 @@
+x-app: &app
+  image: ${APP_IMAGE:?Set immutable ECR digest}
+  env_file: /opt/ghibli/.env
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "5"}
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?}
+      MYSQL_USER: ${MYSQL_USER:?}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+    volumes: [mysql_data:/var/lib/mysql]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -u "$$MYSQL_USER" "$$MYSQL_DATABASE" -e "SELECT 1"']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, 'yes', --appendfsync, always, --maxmemory, 128mb, --maxmemory-policy, noeviction]
+    volumes: [redis_data:/data]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *app
+    command: [flask, --app, wsgi:app, db, upgrade]
+    restart: 'no'
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  api:
+    <<: *app
+    ports: ['127.0.0.1:8000:8000']
+    restart: unless-stopped
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set DNS hostname}
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+volumes:
+  mysql_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

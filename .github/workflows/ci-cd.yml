@@ -1,0 +1,130 @@
+name: test-build-deploy
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        database: [sqlite, mysql]
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+          MYSQL_DATABASE: ghibli_test
+          MYSQL_USER: tester
+          MYSQL_PASSWORD: ci-test-only
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+      redis:
+        image: redis:7.4-alpine
+        ports: ['6379:6379']
+        options: --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=3s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - name: Tests and migrations
+        env:
+          DB_KIND: ${{ matrix.database }}
+          TEST_REDIS_URL: redis://127.0.0.1:6379/15
+        run: |
+          if [ "$DB_KIND" = mysql ]; then
+            export TEST_DATABASE_URL='mysql+pymysql://tester:ci-test-only@127.0.0.1:3306/ghibli_test'
+          fi
+          pytest --junitxml=test-results.xml --cov-report=xml --cov-report=term-missing
+      - run: pip-audit -r requirements.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.database }}
+          path: |
+            test-results.xml
+            coverage.xml
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+      - id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "ref=$REGISTRY/$REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Deploy with SSM and verify remote exit status
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          REGION: ${{ vars.AWS_REGION }}
+          INSTANCE: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          python - <<'PYTHON'
+          import json, os, shlex
+          command = 'bash /opt/ghibli/deploy.sh ' + shlex.quote(os.environ['IMAGE']) + ' ' + shlex.quote(os.environ['REGION'])
+          with open('parameters.json', 'w') as f:
+              json.dump({'commands': [command], 'executionTimeout': ['900']}, f)
+          PYTHON
+          id=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript --parameters file://parameters.json --query Command.CommandId --output text)
+          for attempt in $(seq 1 90); do
+            status=$(aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE" --query Status --output text 2>/dev/null || true)
+            case "$status" in
+              Success) exit 0 ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation --command-id "$id" --instance-id "$INSTANCE"
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo 'No se confirmó el resultado remoto dentro de 15 minutos'
+          exit 1
